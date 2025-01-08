@@ -74,6 +74,3 @@ The flags used:
 
 MIT
 
-## Contributing
-
-See CONTRIBUTING.md for development setup and guidelines.
