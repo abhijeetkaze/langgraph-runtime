@@ -36,6 +36,15 @@ source .venv/bin/activate  # or `.venv/Scripts/activate` on Windows
 uv pip install -e .
 ```
 
+## Model Configuration
+
+```bash
+# Gets Claude by default
+llm = create_llm()  
+# Or for OpenAI:
+llm = create_llm(LLMConfig(provider=ModelProvider.OPENAI))
+```
+
 ## Give it a try
 
 Simple Task:
@@ -68,7 +77,7 @@ The flags used:
 ## Requirements
 
 - Python 3.12 or newer
-- OpenAI API key in `OPENAI_API_KEY` environment variable (or set in `~/.env` file)
+- OpenAI or Anthropic API key in `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` environment variable (or set in `~/.env` file)
 
 ## License
 

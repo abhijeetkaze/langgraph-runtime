@@ -1,5 +1,5 @@
 import asyncio
-from typing import Dict, List, Optional, Any, TypedDict, Union, Annotated, NewType
+from typing import Dict, List, Optional, Any, TypedDict, Union, Annotated, NewType, Type
 from functools import partial
 import logging
 import uuid
@@ -9,7 +9,9 @@ from pydantic import BaseModel, Field, conint
 from enum import Enum
 from langgraph.graph import StateGraph, END, START
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
 from dotenv import load_dotenv
 import colorlog
 
@@ -76,6 +78,70 @@ def setup_logger():
     return app_logger
 logger = setup_logger()
 
+class ModelProvider(str, Enum):
+    """Supported model providers"""
+    OPENAI = "openai"
+    ANTHROPIC = "anthropic"
+
+class LLMConfig(BaseModel):
+    """Configuration for LLM usage"""
+    provider: ModelProvider = Field(
+        default=ModelProvider.ANTHROPIC,
+        description="Model provider to use"
+    )
+    openai_model: str = Field(default="gpt-4o")
+    claude_model: str = Field(default="claude-3-5-sonnet-20240620")
+    temperature: float = Field(default=0.7, ge=0.0, le=1.0)
+
+def create_llm(config: Optional[LLMConfig] = None) -> BaseChatModel:
+    """Create a configured LLM instance
+    
+    This function creates an LLM that works exactly like ChatOpenAI,
+    maintaining compatibility with .with_structured_output() and other
+    LangChain features.
+    
+    Args:
+        config: Optional LLM configuration
+        
+    Returns:
+        BaseChatModel: Configured LLM instance
+        
+    Example:
+        ```python
+        # Use in existing code
+        llm = create_llm()  # Gets Claude by default
+        structured_llm = llm.with_structured_output(RequirementsQuestions)
+        chain = questions_prompt | structured_llm
+        
+        # Or use OpenAI
+        config = LLMConfig(provider=ModelProvider.OPENAI)
+        llm = create_llm(config)
+        ```
+    """
+    config = config or LLMConfig()
+    
+    try:
+        if config.provider == ModelProvider.OPENAI:
+            return ChatOpenAI(
+                model=config.openai_model,
+                temperature=config.temperature
+            )
+        return ChatAnthropic(
+            model=config.claude_model,
+            temperature=config.temperature
+        )
+            
+    except Exception as e:
+        logger.error(f"Error creating LLM with provider {config.provider}: {e}")
+        # Fallback to Claude if OpenAI fails
+        if config.provider == ModelProvider.OPENAI:
+            logger.info("Falling back to Claude")
+            return ChatAnthropic(
+                model="claude-3-opus-20240229",
+                temperature=config.temperature
+            )
+        raise
+    
 # Replace conint usage with a custom type
 StepID = NewType('StepID', int)
 
@@ -339,7 +405,7 @@ async def generate_questions(state: PlannerState) -> Dict[str, Any]:
     
     try:
         # Create LLM with structured output
-        llm = ChatOpenAI(model="gpt-4o", temperature=0.7)
+        llm = create_llm() 
         structured_llm = llm.with_structured_output(RequirementsQuestions)
         
         # Create and execute chain
@@ -445,7 +511,7 @@ async def generate_specialist_prompt(task_description: str) -> str:
         Focus on the specific expertise and perspective needed.""")
     ])
     
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.7)
+    llm = create_llm() 
     chain = prompt | llm
     
     result = await chain.ainvoke({"task": task_description})
@@ -619,7 +685,7 @@ Generate a structured execution plan.""")
             raise ValueError("No requirements gathered - cannot create plan")
 
         # Create LLM with structured output
-        llm = ChatOpenAI(model="gpt-4o", temperature=0.7)
+        llm = create_llm() 
         structured_llm = llm.with_structured_output(GeneratedPlan)
         chain = planner_prompt | structured_llm
         
@@ -744,7 +810,7 @@ async def execute_step(
         logger.info(f"Executing step #{step_key}: {step_info.description}")
         
         # Create or use provided LLM instance
-        step_llm = llm or ChatOpenAI(model="gpt-4o", temperature=0.7)
+        step_llm = llm or create_llm() 
         
         # Generate specialized system prompt
         system_prompt = await generate_specialist_prompt(step_info.description)
@@ -887,7 +953,7 @@ def create_execution_graph(
     logger.debug(f"Initialized step_data with keys: {list(step_data.keys())}")
     
     # Create LLM instance to be shared across steps
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.7)
+    llm = create_llm() 
     
     # Create step data dictionary
     step_data = {str(step.id): step for step in plan.steps}

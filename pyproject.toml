@@ -12,6 +12,7 @@ dependencies = [
     "langchain-core",
     "pydantic",
     "colorlog",
+    "langchain-anthropic>=0.3.1",
 ]
 
 [build-system]
