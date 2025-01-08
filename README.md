@@ -1,4 +1,4 @@
-# Runtime Graph System
+# Runtime Graph with LangGraph and Langchain
 
 Research implementation of DAG (Directed Acyclic Graph) focusing on runtime graph generation and execution via LangGraph nodes. This is an exploratory project that intentionally avoids using LangChain tools and agent registry to enable flexible experimentation. A proper tool and custom agent registry will be implemented in future iterations (maybe). The current approach was chosen to explore core functionality without additional abstractions.
 
