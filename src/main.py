@@ -1,4 +1,5 @@
 import asyncio
+import argparse
 from typing import Dict, List, Optional, Any, TypedDict, Union, Annotated, NewType, Type
 from functools import partial
 import logging
@@ -7,7 +8,8 @@ import re
 import os
 from pydantic import BaseModel, Field, conint
 from enum import Enum
-from langgraph.graph import StateGraph, END, START
+from langgraph.graph import StateGraph, MessagesState, END, START
+from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
@@ -78,6 +80,9 @@ def setup_logger():
     return app_logger
 logger = setup_logger()
 
+# Create shared memory instance for graph persistence
+memory_saver = MemorySaver()
+
 class ModelProvider(str, Enum):
     """Supported model providers"""
     OPENAI = "openai"
@@ -90,7 +95,7 @@ class LLMConfig(BaseModel):
         description="Model provider to use"
     )
     openai_model: str = Field(default="gpt-4o")
-    claude_model: str = Field(default="claude-3-5-sonnet-20240620")
+    claude_model: str = Field(default="claude-3-5-sonnet-20241022")
     temperature: float = Field(default=0.7, ge=0.0, le=1.0)
 
 def create_llm(config: Optional[LLMConfig] = None) -> BaseChatModel:
@@ -198,8 +203,9 @@ class StepResult(TypedDict, total=False):
     system_prompt: Optional[str]
 
 class PlannerState(BaseModel):
-    """State for the planning stage with requirements gathering"""
+    """State for the planning stage with requirements gathering and message history"""
     session_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    messages: List[Dict[str, str]] = Field(default_factory=list)  # Chat history
     query: str
     context: Optional[Dict[str, Any]] = None
     requirements: Dict[str, Any] = Field(default_factory=dict)
@@ -246,9 +252,26 @@ def dict_merge(dict1: Dict[str, StepResult], dict2: Dict[str, StepResult]) -> Di
         
     return {**dict1, **dict2}
 
+def list_merge(list1: List[Any], list2: List[Any]) -> List[Any]:
+    """Merge two lists for concurrent state updates.
+    
+    Args:
+        list1: First list
+        list2: Second list
+        
+    Returns:
+        List[Any]: Combined list
+    """
+    if not list1:
+        return list2
+    if not list2:
+        return list1
+    return list1 + list2
+
 class RuntimeState(TypedDict, total=False):
-    """Runtime state for execution stage with concurrent execution support"""
+    """Runtime state for execution stage with message history support"""
     session_id: str
+    messages: Annotated[List[Dict[str, str]], list_merge]  # Chat history using list_merge
     plan: Plan
     step_data: Dict[str, PlanStep]
     agent_results: Annotated[Dict[str, StepResult], dict_merge]
@@ -370,17 +393,7 @@ class RequirementsQuestions(BaseModel):
     )
 
 async def generate_questions(state: PlannerState) -> Dict[str, Any]:
-    """Generate clarifying questions to gather task requirements.
-    
-    Uses GPT-4 to analyze the task and generate focused questions based on 
-    task complexity and type. Scales the question count based on task scope.
-    
-    Args:
-        state: Current planner state containing task query and context
-        
-    Returns:
-        Dict[str, Any]: Updates to state including generated questions and next stage
-    """
+    """Generate questions with conversation context support."""
     questions_prompt = ChatPromptTemplate.from_messages([
         ("system", """You are an expert requirements analyst. Your task is to generate 
         focused questions to gather key requirements for the given task.
@@ -395,8 +408,11 @@ async def generate_questions(state: PlannerState) -> Dict[str, Any]:
         2. Identify key constraints
         3. Surface any hidden assumptions
         
-        Analyze the task first, then generate appropriate questions."""),
-        ("user", """Task: {task}
+        Consider any previous conversation context when generating new questions."""),
+        ("user", """Previous Conversation:
+        {conversation_history}
+        
+        Task: {task}
         
         Context (if available): {context}
         
@@ -411,9 +427,16 @@ async def generate_questions(state: PlannerState) -> Dict[str, Any]:
         # Create and execute chain
         chain = questions_prompt | structured_llm
         
+        # Format conversation history from messages
+        conversation_history = "\n".join(
+            f"{m['role']}: {m['content']}" 
+            for m in state.messages[:-1]  # Exclude current query
+        ) if len(state.messages) > 1 else "No previous conversation"
+        
         result = await chain.ainvoke({
+            "conversation_history": conversation_history,
             "task": state.query,
-            "context": state.context if state.context else "No additional context provided"
+            "context": str(state.context) if state.context else "No additional context provided"
         })
         
         logger.info(f"Generated {len(result.questions)} questions")
@@ -426,31 +449,31 @@ async def generate_questions(state: PlannerState) -> Dict[str, Any]:
             logger.warning("No valid questions generated, using fallback question")
             valid_questions = ["Can you provide more details about what you need?"]
         
+        # Return state updates with message
         return {
             "clarifying_questions": valid_questions,
-            "current_stage": "ask_questions"
+            "current_stage": "ask_questions",
+            "messages": [{
+                "role": "assistant",
+                "content": f"I need to ask a few questions to better understand your requirements:\n" + 
+                          "\n".join(f"- {q}" for q in valid_questions)
+            }]
         }
         
     except Exception as e:
         logger.error(f"Error generating questions: {e}")
-        # Fallback to a basic question
+        # Fallback to a basic question and include in message history
         return {
             "clarifying_questions": ["Could you tell me more about your requirements?"],
-            "current_stage": "ask_questions"
+            "current_stage": "ask_questions",
+            "messages": [{
+                "role": "assistant",
+                "content": "I need some additional information to help you better. Could you provide more details?"
+            }]
         }
 
 async def ask_questions(state: PlannerState) -> Dict[str, Any]:
-    """Ask clarifying questions to user and collect responses sequentially.
-    
-    Processes each unanswered question in sequence, collecting responses and
-    updating state. Moves to plan creation once all questions are answered.
-    
-    Args:
-        state: Current planner state containing questions and previous responses
-        
-    Returns:
-        Dict[str, Any]: Updates to state including new responses or stage transition
-    """
+    """Process questions and collect responses sequentially with message history."""
     try:
         # Find first unanswered question
         unanswered_questions = [
@@ -460,7 +483,13 @@ async def ask_questions(state: PlannerState) -> Dict[str, Any]:
         
         if not unanswered_questions:
             logger.info("All questions answered, moving to plan creation")
-            return {"current_stage": "create_plan"}
+            return {
+                "current_stage": "create_plan",
+                "messages": [{
+                    "role": "assistant",
+                    "content": "Thank you for providing those details. I'll now create a plan based on your requirements."
+                }]
+            }
             
         # Get next question and collect response
         current_question = unanswered_questions[0]
@@ -473,21 +502,41 @@ async def ask_questions(state: PlannerState) -> Dict[str, Any]:
             "question_responses": {
                 **state.question_responses,
                 current_question: response
-            }
+            },
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": current_question
+                },
+                {
+                    "role": "user",
+                    "content": response
+                }
+            ]
         }
         
         # Check if this was the last question
         if len(updates["question_responses"]) == len(state.clarifying_questions):
             logger.info("All questions answered, proceeding to plan creation")
             updates["current_stage"] = "create_plan"
+            # Add a transition message
+            updates["messages"].append({
+                "role": "assistant",
+                "content": "Thank you for answering all my questions. I'll now create a plan based on your requirements."
+            })
         
         return updates
         
     except Exception as e:
         logger.error(f"Error during question asking: {e}")
         # If there's an error, move to plan creation with what we have
-        return {"current_stage": "create_plan"}
-
+        return {
+            "current_stage": "create_plan",
+            "messages": [{
+                "role": "assistant",
+                "content": "I encountered an issue while processing your response. I'll proceed with the information I have."
+            }]
+        }
 
 async def generate_specialist_prompt(task_description: str) -> str:
     """Generate a specialized system prompt for a specific task.
@@ -1009,7 +1058,8 @@ def create_execution_graph(
         agent_results={}
     )
 
-    return graph.compile(), initial_state
+    # Add persistence support
+    return graph.compile(checkpointer=memory_saver), initial_state
 
 def create_planner_graph() -> StateGraph:
     """Create planning stage graph for requirements gathering.
@@ -1072,41 +1122,38 @@ def create_planner_graph() -> StateGraph:
     
     # Connect final node
     graph.add_edge("create_plan", END)
-    
-    return graph.compile()
+
+    # Add persistence support
+    return graph.compile(checkpointer=memory_saver)
 
 async def process_task(
     query: str,
     context: Optional[Dict[str, Any]] = None,
     save_steps: bool = False,
-    output_dir: str = './steps'
+    output_dir: str = './steps',
+    thread_id: Optional[str] = None,
+    previous_messages: Optional[List[Dict[str, str]]] = None
 ) -> RuntimeState:
-    """Process a task through planning and execution stages.
-    
-    Main entry point that:
-    1. Runs planning graph to gather requirements and create plan
-    2. Creates and runs execution graph based on plan
-    3. Handles logging and error reporting
-    
-    Args:
-        query: Task description to process
-        context: Optional additional context
-        save_steps: Whether to save step results to files
-        output_dir: Directory to save step files
-        
-    Returns:
-        RuntimeState: Final state after execution
-        
-    Raises:
-        Exception: If any stage fails
-    """
+    """Process task through planning and execution stages with message history support."""
     try:
-        # Planning Stage
-        planner_graph = create_planner_graph()
-        initial_planner_state = PlannerState(query=query, context=context)
+        # Create config with thread_id if provided
+        config = {"configurable": {"thread_id": thread_id}} if thread_id else {}
         
+        # Initialize messages with previous history if provided
+        initial_messages = list(previous_messages) if previous_messages else []
+        initial_messages.append({"role": "user", "content": query})
+        
+        # Create initial state with messages
+        initial_planner_state = PlannerState(
+            query=query,
+            context=context,
+            messages=initial_messages
+        )
+        
+        # Planning Stage
         logger.info("Starting planning phase")
-        planner_result = await planner_graph.ainvoke(initial_planner_state)
+        planner_graph = create_planner_graph()
+        planner_result = await planner_graph.ainvoke(initial_planner_state, config=config)
         
         if not planner_result.get("selected_plan"):
             raise ValueError("Planning phase completed but no plan was generated")
@@ -1121,13 +1168,16 @@ async def process_task(
         
         # Execution Stage
         logger.info("\nStarting execution phase")
-        graph, initial_state = create_execution_graph(
+        graph, execution_state = create_execution_graph(
             plan,
             save_steps=save_steps,
             output_dir=output_dir
         )
         
-        final_state = await graph.ainvoke(initial_state)
+        # Initialize message history in execution state
+        execution_state["messages"] = planner_result.get("messages", initial_messages)
+        
+        final_state = await graph.ainvoke(execution_state, config=config)
         
         # Log execution results
         logger.info("\nExecution Results:")
@@ -1136,10 +1186,20 @@ async def process_task(
             logger.info(f"\nStep {step_id} ({step.description}):")
             logger.info(f"Result: {result['result']}")
         
+        # Add final answer to message history as a new list item
         if final_answer := final_state.get("final_answer"):
             logger.info(f"\nFinal Answer: {final_answer}")
+            messages = final_state.get("messages", [])
+            messages.append({"role": "assistant", "content": final_answer})
+            final_state["messages"] = messages
         else:
             logger.warning("No final answer generated")
+            messages = final_state.get("messages", [])
+            messages.append({
+                "role": "assistant", 
+                "content": "I completed the task but couldn't generate a final answer."
+            })
+            final_state["messages"] = messages
         
         return final_state
         
@@ -1147,25 +1207,46 @@ async def process_task(
         logger.error(f"Error during task processing: {str(e)}")
         raise
 
-def cli() -> int:
-    """Command-line interface for the runtime graph system.
+async def get_task_history(planner_graph: StateGraph, thread_id: str):
+    """Get the complete history of a task's execution.
     
-    Handles command-line arguments and executes task processing.
-    Provides feedback and error reporting to the user.
-    
-    Returns:
-        int: Exit code (0 for success, 1 for error)
+    Args:
+        planner_graph: The compiled planner graph
+        thread_id: The thread ID of the task
     """
-    import argparse
+    config = {"configurable": {"thread_id": thread_id}}
     
-    # Create argument parser
+    # Get state history (most recent first)
+    history = list(planner_graph.get_state_history(config))
+    
+    logger.info(f"\nTask History for thread {thread_id}:")
+    for snapshot in history:
+        logger.info(f"\nState Values: {snapshot.values}")
+        logger.info(f"Metadata: {snapshot.metadata}")
+        logger.info(f"Next Steps: {snapshot.next}")
+
+async def continue_task(thread_id: str, follow_up_query: str):
+    """Continue a previous task using its thread ID.
+    
+    Args:
+        thread_id: The thread ID of the previous task
+        follow_up_query: The follow-up question or task
+    """
+    return await process_task(
+        query=follow_up_query,
+        thread_id=thread_id  # Reuse same thread_id
+    )
+    
+def cli() -> int:
+    """Command-line interface for the runtime graph system."""
     parser = argparse.ArgumentParser(
         description='Runtime Graph System',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   runtime-graph --input "Create a Python script to process CSV files"
-  runtime-graph --input "Analyze this dataset" --debug --save-steps
+  runtime-graph --input "Analyze this dataset" --thread-id "conversation-1"
+  runtime-graph --input "Continue previous task" --thread-id "conversation-1"
         """
     )
     
@@ -1174,6 +1255,13 @@ Examples:
         type=str,
         required=True,
         help='Task description to execute'
+    )
+    
+    parser.add_argument(
+        '--thread-id',
+        type=str,
+        default=str(uuid.uuid4()),
+        help='Thread ID for persistence (default: auto-generated UUID)'
     )
     
     parser.add_argument(
@@ -1211,12 +1299,15 @@ Examples:
                 logger.error(f"Failed to create output directory {args.output_dir}: {e}")
                 return 1
         
-        # Execute task
+        # Execute task with thread_id
         logger.info(f"Processing task: {args.input}")
+        logger.info(f"Using thread ID: {args.thread_id}")
+        
         result = asyncio.run(process_task(
             query=args.input,
             save_steps=args.save_steps,
-            output_dir=args.output_dir
+            output_dir=args.output_dir,
+            thread_id=args.thread_id
         ))
         
         # Check execution success
