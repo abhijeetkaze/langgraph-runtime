@@ -1208,12 +1208,7 @@ async def process_task(
         raise
 
 async def get_task_history(planner_graph: StateGraph, thread_id: str):
-    """Get the complete history of a task's execution.
-    
-    Args:
-        planner_graph: The compiled planner graph
-        thread_id: The thread ID of the task
-    """
+    """Get the complete history of a task's execution."""
     config = {"configurable": {"thread_id": thread_id}}
     
     # Get state history (most recent first)
@@ -1222,7 +1217,22 @@ async def get_task_history(planner_graph: StateGraph, thread_id: str):
     logger.info(f"\nTask History for thread {thread_id}:")
     for snapshot in history:
         logger.info(f"\nState Values: {snapshot.values}")
-        logger.info(f"Metadata: {snapshot.metadata}")
+        # Handle both dictionary and object-like state values
+        values = snapshot.values
+        if isinstance(values, dict):
+            if "messages" in values:
+                logger.info("Messages:")
+                for msg in values["messages"]:
+                    logger.info(f"  {msg['role']}: {msg['content']}")
+        else:
+            if hasattr(values, 'query'):
+                logger.info(f"Query: {values.query}")
+            if hasattr(values, 'messages'):
+                logger.info("Messages:")
+                for msg in values.messages:
+                    logger.info(f"  {msg['role']}: {msg['content']}")
+            if hasattr(values, 'question_responses'):
+                logger.info(f"Responses: {values.question_responses}")
         logger.info(f"Next Steps: {snapshot.next}")
 
 async def continue_task(thread_id: str, follow_up_query: str):
