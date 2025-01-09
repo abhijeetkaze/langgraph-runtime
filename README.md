@@ -235,7 +235,7 @@ async def run_research_workflow():
 The repository includes an example workflow that demonstrates conversation threading and task history tracking.
 You can find it in `example_workflow.py`:
 
-```python
+```bash
 # Run the example workflow
 python example_workflow.py
 ```
