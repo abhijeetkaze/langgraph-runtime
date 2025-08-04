@@ -14,6 +14,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
+from langchain_groq import ChatGroq
 from dotenv import load_dotenv
 import colorlog
 
@@ -87,15 +88,17 @@ class ModelProvider(str, Enum):
     """Supported model providers"""
     OPENAI = "openai"
     ANTHROPIC = "anthropic"
+    GROQ = "groq"
 
 class LLMConfig(BaseModel):
     """Configuration for LLM usage"""
     provider: ModelProvider = Field(
-        default=ModelProvider.ANTHROPIC,
+        default=ModelProvider.GROQ,
         description="Model provider to use"
     )
     openai_model: str = Field(default="gpt-4o")
     claude_model: str = Field(default="claude-3-5-sonnet-20241022")
+    groq_model: str = Field(default="llama-3.3-70b-versatile")
     temperature: float = Field(default=0.7, ge=0.0, le=1.0)
 
 def create_llm(config: Optional[LLMConfig] = None) -> BaseChatModel:
@@ -130,6 +133,10 @@ def create_llm(config: Optional[LLMConfig] = None) -> BaseChatModel:
             return ChatOpenAI(
                 model=config.openai_model,
                 temperature=config.temperature
+            )
+        elif config.provider == ModelProvider.GROQ:
+            return ChatGroq(
+                model=config.groq_model,
             )
         return ChatAnthropic(
             model=config.claude_model,

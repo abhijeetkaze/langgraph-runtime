@@ -8,6 +8,7 @@ dependencies = [
     "openai",
     "python-dotenv",
     "langchain-openai",
+    "langchain-groq",
     "langgraph",
     "langchain-core",
     "pydantic",
