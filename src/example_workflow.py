@@ -15,13 +15,13 @@ async def main():
     
     try:
         # First execution
-        logger.info("\n=== Initial Task ===")
-        result = await process_task(
-            query="Design a fault-tolerant message queue",
-            thread_id="mq-desig",
-            save_steps=True,
-            output_dir="./design_steps"
-        )
+        # logger.info("\n=== Initial Task ===")
+        # result = await process_task(
+        #     query="Design a fault-tolerant message queue",
+        #     thread_id="mq-desig",
+        #     save_steps=True,
+        #     output_dir="./design_steps"
+        # )
         
         # Get task history
         logger.info("\n=== Task History ===")
